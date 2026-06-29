@@ -72,8 +72,8 @@ data:
             local_ts  = 0.0.0.0/0
             remote_ts = 0.0.0.0/0
             esp_proposals = aes256-sha256-modp2048,aes128-sha256-modp2048
-            start_action = start
-            dpd_action = clear
+            start_action = trap
+            dpd_action = restart
           }
         }
       }
