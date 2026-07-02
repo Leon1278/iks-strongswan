@@ -1,0 +1,302 @@
+# ============================================
+# IPsec-Server ConfigMap (unchanged)
+# ============================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ipsec-server-config
+  labels:
+    app: ipsec-server
+data:
+  swanctl.conf: |
+    connections {
+      server-tunnel {
+        version = 2
+        proposals = aes256-sha256-modp2048,aes128-sha256-modp2048
+
+        local {
+          auth = psk
+          id = server.example.com
+        }
+        remote {
+          auth = psk
+          id = client.example.com
+        }
+
+        children {
+          server-child {
+            local_ts  = 0.0.0.0/0
+            remote_ts = 0.0.0.0/0
+            esp_proposals = aes256-sha256-modp2048,aes128-sha256-modp2048
+            start_action = trap
+            dpd_action = clear
+          }
+        }
+      }
+    }
+    secrets {
+      ike-server-tunnel {
+        id = client.example.com
+        secret = "yWOMZrfcu15TQXdIRF7+7dFS7NUCGBWp"
+      }
+    }
+
+---
+# ============================================
+# IPsec-Client ConfigMap
+# CHANGE: remote_addrs jetzt auf den Service-Namen gesetzt
+# ============================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ipsec-client-config
+  labels:
+    app: ipsec-client
+data:
+  swanctl.conf: |
+    connections {
+      client-tunnel {
+        remote_addrs = ipsec-server-service  # CHANGE: Service-Name statt Host-IP
+        version = 2
+        proposals = aes256-sha256-modp2048,aes128-sha256-modp2048
+
+        local {
+          auth = psk
+          id = client.example.com
+        }
+        remote {
+          auth = psk
+          id = server.example.com
+        }
+
+        children {
+          client-child {
+            local_ts  = 0.0.0.0/0
+            remote_ts = 0.0.0.0/0
+            esp_proposals = aes256-sha256-modp2048,aes128-sha256-modp2048
+            start_action = start
+            dpd_action = clear
+          }
+        }
+      }
+    }
+    secrets {
+      ike-client-tunnel {
+        id = client.example.com
+        secret = "yWOMZrfcu15TQXdIRF7+7dFS7NUCGBWp"
+      }
+    }
+
+---
+# ============================================
+# NEW: Service für IPsec-Server
+# FIX: Ports mit 'name' ergänzt
+# ============================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: ipsec-server-service
+spec:
+  selector:
+    app: ipsec-server
+  ports:
+    - name: ike-port
+      protocol: UDP
+      port: 500  # IKE-Port
+      targetPort: 500
+    - name: nat-traversal-port
+      protocol: UDP
+      port: 4500 # NAT-Traversal
+      targetPort: 4500
+  type: ClusterIP  # oder LoadBalancer, je nach Umgebung
+
+---
+# ============================================
+# NEW: Service für IPsec-Client
+# FIX: Ports mit 'name' ergänzt
+# ============================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: ipsec-client-service
+spec:
+  selector:
+    app: ipsec-client
+  ports:
+    - name: ike-port
+      protocol: UDP
+      port: 500
+      targetPort: 500
+    - name: nat-traversal-port
+      protocol: UDP
+      port: 4500
+      targetPort: 4500
+  type: ClusterIP
+
+---
+# ============================================
+# NEW: NetworkPolicy (optional, falls benötigt)
+# Erlaubt UDP-Traffic zwischen Server und Client
+# ============================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ipsec-traffic
+spec:
+  podSelector:
+    matchLabels:
+      app: ipsec-server
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: ipsec-client
+    ports:
+    - protocol: UDP
+      port: 500
+    - protocol: UDP
+      port: 4500
+  policyTypes:
+  - Ingress
+
+---
+# ============================================
+# IPsec-Server Deployment
+# CHANGE: hostNetwork und dnsPolicy entfernt
+# CHANGE: nodeName durch nodeAffinity ersetzt
+# ============================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ipsec-server
+  labels:
+    app: ipsec-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ipsec-server
+  template:
+    metadata:
+      labels:
+        app: ipsec-server
+    spec:
+      # CHANGE: nodeName entfernt, stattdessen nodeAffinity
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: In
+                values:
+                - minikube-m02  # CHANGE: Node-Name hier eintragen
+      initContainers:
+      - name: create-dirs
+        image: alpine:latest
+        command: ["sh", "-c", "mkdir -p /run/xtables.lock /var/run/charon && chmod 777 /run/xtables.lock /var/run/charon"]
+        volumeMounts:
+        - name: xtables-lock
+          mountPath: /run/xtables.lock
+        - name: charon
+          mountPath: /var/run/charon
+      containers:
+      - name: strongswan
+        image: strongx509/strongswan:latest
+        imagePullPolicy: Always
+        securityContext:
+          privileged: true
+          capabilities:
+            add: ["NET_ADMIN", "SYS_ADMIN"]
+        command: ["/usr/libexec/ipsec/charon"]
+        args: ["--use-syslog", "--debug-ike=4", "--debug-knl=4", "--debug-cfg=4", "--debug-net=4"]
+        volumeMounts:
+        - name: swanctl-config
+          mountPath: /etc/swanctl/swanctl.conf
+          subPath: swanctl.conf
+        - name: xtables-lock
+          mountPath: /run/xtables.lock
+        - name: charon
+          mountPath: /var/run/charon
+        env:
+        - name: TZ
+          value: "Europe/Berlin"
+      volumes:
+      - name: swanctl-config
+        configMap:
+          name: ipsec-server-config
+      - name: xtables-lock
+        emptyDir: {}
+      - name: charon
+        emptyDir: {}
+
+---
+# ============================================
+# IPsec-Client Deployment
+# CHANGE: hostNetwork und dnsPolicy entfernt
+# CHANGE: nodeName durch nodeAffinity ersetzt
+# ============================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ipsec-client
+  labels:
+    app: ipsec-client
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ipsec-client
+  template:
+    metadata:
+      labels:
+        app: ipsec-client
+    spec:
+      # CHANGE: nodeName entfernt, stattdessen nodeAffinity
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: In
+                values:
+                - minikube-m03  # CHANGE: Node-Name hier eintragen
+      initContainers:
+      - name: create-dirs
+        image: alpine:latest
+        command: ["sh", "-c", "mkdir -p /run/xtables.lock /var/run/charon && chmod 777 /run/xtables.lock /var/run/charon"]
+        volumeMounts:
+        - name: xtables-lock
+          mountPath: /run/xtables.lock
+        - name: charon
+          mountPath: /var/run/charon
+      containers:
+      - name: strongswan
+        image: strongx509/strongswan:latest
+        imagePullPolicy: Always
+        securityContext:
+          privileged: true
+          capabilities:
+            add: ["NET_ADMIN", "SYS_ADMIN"]
+        command: ["/usr/libexec/ipsec/charon"]
+        args: ["--use-syslog", "--debug-ike=4", "--debug-knl=4", "--debug-cfg=4", "--debug-net=4"]
+        volumeMounts:
+        - name: swanctl-config
+          mountPath: /etc/swanctl/swanctl.conf
+          subPath: swanctl.conf
+        - name: xtables-lock
+          mountPath: /run/xtables.lock
+        - name: charon
+          mountPath: /var/run/charon
+        env:
+        - name: TZ
+          value: "Europe/Berlin"
+      volumes:
+      - name: swanctl-config
+        configMap:
+          name: ipsec-client-config
+      - name: xtables-lock
+        emptyDir: {}
+      - name: charon
+        emptyDir: {}
