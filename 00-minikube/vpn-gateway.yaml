@@ -1,0 +1,104 @@
+# ============================================
+# IPsec-Client ConfigMap
+# CHANGE: remote_addrs jetzt auf den Service-Namen gesetzt
+# ============================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ipsec-client-config
+  labels:
+    app: ipsec-client
+data:
+  swanctl.conf: |
+    connections {
+      client-tunnel {
+        remote_addrs = 192.168.15.129
+        version = 2
+        proposals = aes256-sha256-modp2048,aes128-sha256-modp2048
+
+        local {
+          auth = psk
+          id = client.example.com
+        }
+        remote {
+          auth = psk
+          id = server.example.com
+        }
+
+        children {
+          client-child {
+            local_ts  = 10.244.2.17/32
+            remote_ts = 10.244.1.17/32
+            esp_proposals = aes256-sha256-modp2048,aes128-sha256-modp2048
+            start_action = start
+            dpd_action = clear
+          }
+        }
+      }
+    }
+    secrets {
+      ike-client-tunnel {
+        id = client.example.com
+        secret = "yWOMZrfcu15TQXdIRF7+7dFS7NUCGBWp"
+      }
+    }
+---
+# ============================================
+# IPsec-Client Deployment
+# CHANGE: hostNetwork und dnsPolicy entfernt
+# CHANGE: nodeName durch nodeAffinity ersetzt
+# ============================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ipsec-client
+  labels:
+    app: ipsec-client
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ipsec-client
+  template:
+    metadata:
+      labels:
+        app: ipsec-client
+    spec:
+      initContainers:
+      - name: create-dirs
+        image: alpine:latest
+        command: ["sh", "-c", "mkdir -p /run/xtables.lock /var/run/charon && chmod 777 /run/xtables.lock /var/run/charon"]
+        volumeMounts:
+        - name: xtables-lock
+          mountPath: /run/xtables.lock
+        - name: charon
+          mountPath: /var/run/charon
+      containers:
+      - name: strongswan
+        image: strongx509/strongswan:latest
+        imagePullPolicy: Always
+        securityContext:
+          privileged: true
+          capabilities:
+            add: ["NET_ADMIN", "SYS_ADMIN"]
+        command: ["/usr/libexec/ipsec/charon"]
+        args: ["--use-syslog", "--debug-ike=4", "--debug-knl=4", "--debug-cfg=4", "--debug-net=4"]
+        volumeMounts:
+        - name: swanctl-config
+          mountPath: /etc/swanctl/swanctl.conf
+          subPath: swanctl.conf
+        - name: xtables-lock
+          mountPath: /run/xtables.lock
+        - name: charon
+          mountPath: /var/run/charon
+        env:
+        - name: TZ
+          value: "Europe/Berlin"
+      volumes:
+      - name: swanctl-config
+        configMap:
+          name: ipsec-client-config
+      - name: xtables-lock
+        emptyDir: {}
+      - name: charon
+        emptyDir: {}
